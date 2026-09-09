@@ -272,6 +272,14 @@ class CustomVoiceClient(discord.voice.VoiceClient):
         super().__init__(*args, **kwargs)
         self._sink = WaveSink()
 
+    @property
+    def loop(self):
+        """Always return the currently-running event loop, so voice tasks
+        (voice-connector, voice-ws-poller) are bound to the same loop as the
+        rest of the bot. Fixes py-cord's get_event_loop() mismatch on
+        Python 3.13, which otherwise causes 'attached to a different loop'."""
+        return asyncio.get_running_loop()
+
     # --- Speaking hook (voice-gateway op 5) ---
     # py-cord's VoiceClient._handle_speaking is a no-op. Discord sends this
     # with the user id and a speaking flag. We use it for real start/stop.
