@@ -63,7 +63,7 @@ os.makedirs(RECORDINGS_DIR, exist_ok=True)
 # --- Discord Intents ---
 intents = discord.Intents.default()
 intents.members = True
-intents.presence = True
+intents.presences = True
 
 # --- Bot Initialization ---
 bot = discord.Client(intents=intents)
