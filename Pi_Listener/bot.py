@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import discord
+import discord.voice
 from discord.sinks import WaveSink
 # py-cord (pip package: py-cord) is the actively-maintained fork of discord.py.
 # Starting with the 2.x rewrite it installs as the `discord` module (same as
@@ -262,7 +263,7 @@ def _spawn_send(wav_file: str, username: str):
 # specific channel before deployment to confirm that audio capture works.
 
 
-class CustomVoiceClient(discord.VoiceClient):
+class CustomVoiceClient(discord.voice.VoiceClient):
     """VoiceClient subclass that captures incoming audio via the documented
     start_listening() API + WaveSink, and tracks per-user speaking state via
     the voice-gateway speaking hook."""
