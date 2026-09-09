@@ -590,8 +590,13 @@ async def _do_voice_connect(channel):
     """Connect to the voice channel with the CustomVoiceClient, guarded by
     _voice_connecting to prevent a double-connect race."""
     global _voice_connecting
-    if channel.voice_client is not None or _voice_connecting:
+    if _voice_connecting:
         return
+    try:
+        if channel.voice_client is not None:
+            return
+    except AttributeError:
+        pass
     _voice_connecting = True
     try:
         vc = await channel.connect(cls=CustomVoiceClient)
