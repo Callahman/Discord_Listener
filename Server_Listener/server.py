@@ -14,19 +14,23 @@ load_dotenv()
 # All env-supplied directory paths are expanduser'd so that values like
 # "~/discord_listener/incoming" resolve to the user's home directory rather
 # than a literal "./~/..." relative path.
-# Directory defaults are repo-relative: the repo is cloned to <home>/discord_listener
-# on both the Pi and the tower, so discord_listener/Server_Listener/<dir> resolves
-# to the same directory on the tower. Override with an absolute path if your
-# layout differs. expanduser is still applied so a user-supplied ~/... value works.
-INCOMING_DIR = os.path.expanduser(os.getenv("INCOMING_DIR", "discord_listener/Server_Listener/incoming"))
-PROCESSED_DIR = os.path.expanduser(os.getenv("PROCESSED_DIR", "discord_listener/Server_Listener/processed"))
-FAILED_DIR = os.path.expanduser(os.getenv("FAILED_DIR", "discord_listener/Server_Listener/failed"))
-LOG_DIR = os.path.expanduser(os.getenv("LOG_DIR", "discord_listener/Server_Listener/logs"))
+#
+# The server is deployed at /mnt/hdd_storage/discord_listener (not the home
+# directory), so the code derives its base path from the location of this
+# file (server.py lives at <base>/Server_Listener/server.py). The default
+# directory values are resolved relative to that base. Override any of them
+# with an absolute path in .env if your layout differs.
+_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+_BASE_DIR = os.path.dirname(_CODE_DIR)  # /mnt/hdd_storage/discord_listener
+INCOMING_DIR = os.path.expanduser(os.getenv("INCOMING_DIR", os.path.join(_BASE_DIR, "Server_Listener", "incoming")))
+PROCESSED_DIR = os.path.expanduser(os.getenv("PROCESSED_DIR", os.path.join(_BASE_DIR, "Server_Listener", "processed")))
+FAILED_DIR = os.path.expanduser(os.getenv("FAILED_DIR", os.path.join(_BASE_DIR, "Server_Listener", "failed")))
+LOG_DIR = os.path.expanduser(os.getenv("LOG_DIR", os.path.join(_BASE_DIR, "Server_Listener", "logs")))
 DISCORD_CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:latest")
 LLM_SYSTEM_PROMPT = os.getenv("LLM_SYSTEM_PROMPT", "You are a helpful assistant. Summarize and analyze the provided transcription.")
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 
@@ -36,7 +40,7 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 # names, so a plain copy would overwrite a previous archive entry). The
 # archive is capped at AUDIO_RETENTION_GB; oldest files are deleted first
 # when the limit is exceeded.
-AUDIO_ARCHIVE_DIR = os.path.expanduser(os.getenv("AUDIO_ARCHIVE_DIR", "discord_listener/Server_Listener/archive"))
+AUDIO_ARCHIVE_DIR = os.path.expanduser(os.getenv("AUDIO_ARCHIVE_DIR", os.path.join(_BASE_DIR, "Server_Listener", "archive")))
 AUDIO_RETENTION_GB = float(os.getenv("AUDIO_RETENTION_GB", "5"))
 
 # Ensure directories exist
@@ -162,9 +166,9 @@ def process_with_llm(transcription: str) -> str:
 
     try:
         from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
+        client = OpenAI(api_key="ollama", base_url=f"{OLLAMA_BASE_URL}/v1")
         response = client.chat.completions.create(
-            model=OPENAI_MODEL,
+            model=OLLAMA_MODEL,
             messages=[
                 {'role': 'system', 'content': LLM_SYSTEM_PROMPT},
                 {'role': 'user', 'content': transcription}
@@ -445,8 +449,11 @@ if __name__ == "__main__":
         raise ValueError("DISCORD_BOT_TOKEN environment variable is not set.")
     if DISCORD_CHANNEL_ID == 0:
         raise ValueError("DISCORD_CHANNEL_ID environment variable is not set.")
-    if not OPENAI_API_KEY:
-        raise ValueError("OPENAI_API_KEY environment variable is not set.")
+    import urllib.request
+    try:
+        urllib.request.urlopen(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+    except Exception as e:
+        raise ValueError(f"Ollama not reachable at {OLLAMA_BASE_URL}: {e}")
 
     async def run_server():
         # Preload the Whisper model on a worker thread before starting the
