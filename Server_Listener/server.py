@@ -189,7 +189,7 @@ def get_discord_client():
     """Return the persistent Discord client, creating it on first use."""
     global _discord_client
     if _discord_client is None:
-        import py_cord as discord
+        import discord
         intents = discord.Intents.default()
         # Note: we do NOT enable message_content. The server only sends
         # messages; enabling a privileged intent that is not turned on in the

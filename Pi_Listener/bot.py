@@ -1,11 +1,10 @@
 import asyncio
 import logging
-import py_cord as discord
-from py_cord.sinks import WaveSink
-# py-cord is the actively-maintained fork of discord.py. It exposes the same
-# top-level API surface (Client, Intents, VoiceClient, etc.) under the
-# `py_cord` module name, so we alias it to `discord` to keep the rest of the
-# code unchanged.
+import discord
+from discord.sinks import WaveSink
+# py-cord (pip package: py-cord) is the actively-maintained fork of discord.py.
+# Starting with the 2.x rewrite it installs as the `discord` module (same as
+# discord.py), so we import it directly.
 #
 # Voice receive: py-cord exposes a documented start_listening() API on
 # VoiceClient that records incoming audio into a Sink object. We use the
