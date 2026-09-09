@@ -617,7 +617,12 @@ async def voice_reconnect_loop():
     while True:
         await asyncio.sleep(30)
         channel = bot.get_channel(VOICE_CHANNEL_ID)
-        if channel and channel.voice_client is None and not _voice_connecting:
+        if channel and not _voice_connecting:
+            try:
+                if channel.voice_client is not None:
+                    continue
+            except AttributeError:
+                pass
             logger.info("Bot disconnected from voice channel. Rejoining...")
             await _do_voice_connect(channel)
 
