@@ -271,14 +271,14 @@ class CustomVoiceClient(discord.voice.VoiceClient):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._sink = WaveSink()
-
-    @property
-    def loop(self):
-        """Always return the currently-running event loop, so voice tasks
-        (voice-connector, voice-ws-poller) are bound to the same loop as the
-        rest of the bot. Fixes py-cord's get_event_loop() mismatch on
-        Python 3.13, which otherwise causes 'attached to a different loop'."""
-        return asyncio.get_running_loop()
+        # py-cord's VoiceClient.__init__ sets self.loop to a non-running loop
+        # (via get_event_loop()) on Python 3.13, which causes 'attached to a
+        # different loop' when voice tasks (voice-connector, voice-ws-poller)
+        # are spawned. Override it with the currently-running loop so those
+        # tasks bind to the same loop as the rest of the bot. This runs during
+        # channel.connect() (inside on_ready), so get_running_loop() returns
+        # the correct loop.
+        self.loop = asyncio.get_running_loop()
 
     # --- Speaking hook (voice-gateway op 5) ---
     # py-cord's VoiceClient._handle_speaking is a no-op. Discord sends this
