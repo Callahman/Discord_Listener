@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+venv/
+env/
+ENV/
+
+# Environment
+.env
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Pi runtime
+recordings/
+*.wav
+
+# Server runtime
+Server_Listener/incoming/
+Server_Listener/processed/
+Server_Listener/failed/
+Server_Listener/logs/
+Server_Listener/archive/
