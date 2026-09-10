@@ -280,44 +280,12 @@ class CustomVoiceClient(discord.voice.VoiceClient):
         # the correct loop.
         self.loop = asyncio.get_running_loop()
 
-    # --- Speaking hook (voice-gateway op 5) ---
-    # py-cord's VoiceClient._handle_speaking is a no-op. Discord sends this
-    # with the user id and a speaking flag. We use it for real start/stop.
-    async def _handle_speaking(self, data):
-        # data shape: {'user': <user_id>, 'speaking': <bool>, 'delay': <int>, 'ssrc': <int>}
-        user_id = data.get('user')
-        speaking = bool(data.get('speaking', False))
-
-        # Find the user object for the name (may be None if not in cache).
-        user = None
-        if user_id is not None:
-            # Try the voice channel's voice states for the user.
-            channel = self.channel
-            if channel is not None:
-                for vs in channel.voice_states:
-                    if vs.user and vs.user.id == user_id:
-                        user = vs.user
-                        break
-            if user is None:
-                user = bot.get_user(user_id)
-
-        if speaking:
-            if user is not None and user_id not in speaking_users:
-                start_recording(user)
-            elif user is not None and user_id in speaking_users:
-                speaking_users[user_id]['last_activity'] = datetime.now()
-            # Genuine speaking event -> update global activity for SSH manager.
-            update_user_activity()
-        else:
-            # Speaking stopped -> stop recording for this user.
-            # Retrieve the user's recorded audio from the WaveSink and write
-            # it to RECORDINGS_DIR.
-            if user_id in speaking_users:
-                if user is not None:
-                    stop_recording(user)
-                else:
-                    # User not in cache; flush directly.
-                    _flush_user_buffer(user_id)
+    # NOTE: The previous _handle_speaking override is REMOVED. In this py-cord
+    # version (2.8.1) VoiceClient has no _handle_speaking method; the
+    # voice-gateway speaking op is handled in _recv_hook, which dispatches the
+    # 'member_speaking_state_update' event to the main client. The main bot
+    # listens for it via on_member_speaking_state_update (see below) for real
+    # per-user start/stop transitions.
 
     # --- Start listening (documented py-cord API) ---
     # Called after connecting to the voice channel. Passes the WaveSink to
@@ -340,8 +308,9 @@ class CustomVoiceClient(discord.voice.VoiceClient):
 def _flush_user_buffer(user_id: int):
     """Save and send the buffer for a user whose object is no longer in cache.
 
-    Retrieves the user's recorded audio from the WaveSink via get_user_audio()
-    and writes it to RECORDINGS_DIR.
+    Retrieves the user's recorded audio from the WaveSink by reading the
+    sink's audio_data entry directly (get_user_audio() is broken in this
+    py-cord version) and writes it to RECORDINGS_DIR.
     """
     if user_id not in speaking_users:
         return
@@ -361,27 +330,20 @@ def _flush_user_buffer(user_id: int):
         return
 
     try:
-        audio = sink.get_user_audio(user_id)
-        if audio is None:
+        # get_user_audio() is BROKEN in this py-cord version: it does
+        # os.path.realpath(self.audio_data.pop(user)) where audio_data[user]
+        # is an AudioData object (wrapping a BytesIO), not a path. It always
+        # raises (KeyError if no audio, TypeError if audio present). Access
+        # the sink's audio_data directly instead. Do NOT pop: the entry is
+        # still being written to by the PacketRouter thread while the user
+        # speaks, and we want to keep it for any subsequent flush.
+        entry = sink.audio_data.get(user_id)
+        if entry is None:
             print(f"No audio recorded for: {username} (user not in cache)")
             return
 
-        if isinstance(audio, str) and os.path.exists(audio):
-            with open(audio, 'rb') as af:
-                audio_data = af.read()
-            # Delete the temp file after reading to avoid accumulating
-            # per-user audio files on disk.
-            try:
-                os.remove(audio)
-            except OSError:
-                pass
-        elif hasattr(audio, 'read'):
-            audio_data = audio.read()
-        elif isinstance(audio, (bytes, bytearray)):
-            audio_data = bytes(audio)
-        else:
-            print(f"Unexpected audio type from get_user_audio: {type(audio)}")
-            return
+        # entry is an AudioData object wrapping a BytesIO of decoded PCM.
+        audio_data = entry.file.getvalue()
 
         if not audio_data:
             print(f"No audio recorded for: {username} (user not in cache)")
@@ -439,6 +401,16 @@ async def on_voice_state_update(member, before, after):
     if member.bot:
         return
 
+    # NOTE: The docstring above is stale — it references the removed
+    # CustomVoiceClient._handle_speaking override. In this py-cord version
+    # (2.8.1) the voice-gateway speaking op is handled in _recv_hook, which
+    # dispatches 'member_speaking_state_update' to the main client. The main
+    # bot listens for it via on_member_speaking_state_update (defined below)
+    # for real per-user start/stop transitions. This on_voice_state_update
+    # handler covers the cases the speaking op does not: channel leave,
+    # channel-to-channel move, and mute/deaf transitions (all stop recording
+    # immediately), plus a safety-net start if the speaking op never fired.
+
     # If the user left the target channel OR moved to another channel, stop
     # recording immediately (not just via the idle timer).
     if before.channel and before.channel.id == VOICE_CHANNEL_ID and \
@@ -463,15 +435,66 @@ async def on_voice_state_update(member, before, after):
     # speaking hook), so mute toggles do not keep the session "active".
     update_user_presence()
 
-    # Fallback: if the voice-gateway speaking hook (_handle_speaking) is not
-    # called by py-cord (e.g., due to a version change in the dispatch
-    # mechanism), start recording here as an approximation. This treats any
-    # voice-state change while in the channel (and not muted/deaf) as
-    # speaking activity. The idle-cleanup task stops recording after 10 s of
-    # inactivity, so this fallback does not produce false-positive recordings
-    # for users who are present but silent.
+    # NOTE: The previous "fallback: start recording" is REMOVED. Real per-user
+    # speaking start/stop now comes from the voice-gateway speaking op via
+    # on_member_speaking_state_update (see below). This handler only covers the
+    # cases the speaking op does not: channel leave, channel-to-channel move,
+    # and mute/deaf transitions (all of which stop recording immediately).
+
+    # Safety net: if the speaking op never fired for this user (e.g., the
+    # voice connection was still establishing when they joined), start
+    # recording here so we don't miss their audio. The idle-cleanup task
+    # stops recording after 10 s of inactivity, so this does not produce
+    # false-positive recordings for users who are present but silent.
     if member.id not in speaking_users:
         start_recording(member)
+
+@bot.event
+async def on_member_speaking_state_update(member, ssrc, state):
+    """Handle the voice-gateway speaking op (real per-user start/stop).
+
+    In py-cord 2.8.1 the voice-gateway speaking op (op 5) is handled in
+    VoiceClient._recv_hook, which dispatches 'member_speaking_state_update'
+    to the main client. The arguments are:
+      - member: a GuildMember (or None if not in cache)
+      - ssrc: the SSRC associated with the user
+      - state: a SpeakingState bitmask (none=0, voice=1, soundshare=2, priority=4)
+
+    A user is producing voice audio when the 'voice' bit (1) is set in the
+    state bitmask. We use this for real per-user start/stop transitions:
+      - voice bit set   -> start recording (or update last_activity)
+      - voice bit clear -> stop recording (save + send the WAV)
+    """
+    if member is None or member.bot:
+        return
+
+    # Only care about users in the target voice channel.
+    channel = bot.get_channel(VOICE_CHANNEL_ID)
+    if channel is None:
+        return
+    in_target = False
+    for vs in channel.voice_states:
+        if vs.user and vs.user.id == member.id:
+            in_target = True
+            break
+    if not in_target:
+        return
+
+    # state is a SpeakingState bitmask. Voice audio is present when the
+    # 'voice' bit (1) is set.
+    is_speaking = bool(int(state) & 1)
+
+    if is_speaking:
+        if member.id not in speaking_users:
+            start_recording(member)
+        else:
+            speaking_users[member.id]['last_activity'] = datetime.now()
+        # Genuine speaking event -> update global activity for SSH manager.
+        update_user_activity()
+    else:
+        # Speaking stopped -> stop recording for this user (save + send WAV).
+        if member.id in speaking_users:
+            stop_recording(member)
 
 def start_recording(member):
     """Start recording for a user.
@@ -491,9 +514,11 @@ def start_recording(member):
 def stop_recording(member):
     """Stop recording for a user and save/send the WAV file.
 
-    Retrieves the user's recorded audio from the WaveSink via get_user_audio()
-    and writes it to RECORDINGS_DIR. The WaveSink handles DTLS/SRTP decryption
-    and Opus decoding internally, producing 16-bit 48kHz WAV data.
+    Retrieves the user's recorded audio from the WaveSink by reading the
+    sink's audio_data entry directly (get_user_audio() is broken in this
+    py-cord version) and writes it to RECORDINGS_DIR. The WaveSink handles
+    DTLS/SRTP decryption and Opus decoding internally, producing 16-bit
+    48kHz PCM data (wrapped in a WAV header below).
     """
     if member.id not in speaking_users:
         return
@@ -514,35 +539,20 @@ def stop_recording(member):
         return
 
     try:
-        # get_user_audio(user) returns the audio file for the user. It pops
-        # the entry from the sink's audio_data dict, so it can only be called
-        # once per user per recording session.
-        #
-        # The return type may be a file path string (os.path.realpath of the
-        # AudioData file), a file-like object, or bytes. Handle all cases.
-        audio = sink.get_user_audio(member.id)
-        if audio is None:
+        # get_user_audio() is BROKEN in this py-cord version: it does
+        # os.path.realpath(self.audio_data.pop(user)) where audio_data[user]
+        # is an AudioData object (wrapping a BytesIO), not a path. It always
+        # raises (KeyError if no audio, TypeError if audio present). Access
+        # the sink's audio_data directly instead. Do NOT pop: the entry is
+        # still being written to by the PacketRouter thread while the user
+        # speaks, and we want to keep it for any subsequent flush.
+        entry = sink.audio_data.get(member.id)
+        if entry is None:
             print(f"No audio recorded for: {username}")
             return
 
-        # Read the audio data from whatever form get_user_audio() returned.
-        if isinstance(audio, str) and os.path.exists(audio):
-            # It's a file path — read the file at that path, then delete the
-            # temp file to avoid accumulating per-user audio files on disk.
-            with open(audio, 'rb') as af:
-                audio_data = af.read()
-            try:
-                os.remove(audio)
-            except OSError:
-                pass
-        elif hasattr(audio, 'read'):
-            # It's a file-like object — read from it.
-            audio_data = audio.read()
-        elif isinstance(audio, (bytes, bytearray)):
-            audio_data = bytes(audio)
-        else:
-            print(f"Unexpected audio type from get_user_audio: {type(audio)}")
-            return
+        # entry is an AudioData object wrapping a BytesIO of decoded PCM.
+        audio_data = entry.file.getvalue()
 
         if not audio_data:
             print(f"No audio recorded for: {username}")
@@ -607,14 +617,39 @@ async def _do_voice_connect(channel):
     except AttributeError:
         pass
     _voice_connecting = True
+    t0 = time.monotonic()
     try:
+        logger.info(f"Voice connect starting for channel '{channel.name}'...")
         vc = await channel.connect(cls=CustomVoiceClient)
+        elapsed = time.monotonic() - t0
+        logger.info(f"Voice connect completed in {elapsed:.1f}s for channel '{channel.name}'.")
+        if elapsed > 30:
+            logger.warning(
+                f"Voice connect took {elapsed:.1f}s (>30s). The event loop may have been "
+                "blocked during connect (Pi load/throttling). This risks the 60s voice "
+                "connect timeout and prevents audio from being received."
+            )
         vc.start_listening()
-        if vc.is_dave_connection():
-            logger.warning("Voice channel is a DAVE (E2EE) call. start_listening() may not capture audio.")
+        # DAVE/E2EE detection: if this is a DAVE call, voice reception is broken
+        # (py-cord emits a RuntimeWarning and decrypt_rtp silently substitutes
+        # OPUS_SILENCE on DAVE decryption failure). Log it clearly.
+        try:
+            is_dave = vc.is_dave_connection()
+        except Exception as dave_err:
+            logger.warning(f"is_dave_connection() raised: {type(dave_err).__name__}: {dave_err}")
+            is_dave = None
+        if is_dave:
+            logger.warning(
+                "Voice channel is a DAVE (E2EE) call. py-cord's voice reception is "
+                "BROKEN for DAVE calls (see Pycord issue #3139). Even if capture works, "
+                "you will get OPUS_SILENCE. Audio will NOT be transcribed."
+            )
+        elif is_dave is False:
+            logger.info("Voice channel is NOT a DAVE (E2EE) call. Voice reception should work.")
         logger.info(f"Joined voice channel: {channel.name}")
     except Exception as e:
-        logger.error(f"Failed to join voice channel: {e}")
+        elapsed = time.monotonic() - t0
+        logger.error(f"Failed to join voice channel after {elapsed:.1f}s: {type(e).__name__}: {e}")
     finally:
         _voice_connecting = False
 
@@ -648,6 +683,61 @@ async def cleanup_inactive_users():
                     stop_recording(member)
                 else:
                     _flush_user_buffer(user_id)
+
+# --- Diagnostic Audio Report ---
+async def diagnostic_audio_report():
+    """Every 10 s, log the per-user byte counts in the WaveSink while users are
+    speaking. This confirms whether audio is actually being captured (non-zero
+    byte counts) or whether the sink is empty (voice connect timed out / DAVE
+    / no packets received). Also logs the total number of users with audio in
+    the sink.
+    """
+    while True:
+        await asyncio.sleep(10)
+        try:
+            channel = bot.get_channel(VOICE_CHANNEL_ID)
+            if not channel:
+                continue
+            vc = getattr(channel, 'voice_client', None)
+            if not isinstance(vc, CustomVoiceClient):
+                continue
+            sink = vc._sink
+            if sink is None:
+                continue
+            # Only report when recording is active (a reader is attached).
+            if not vc.is_recording():
+                continue
+            audio_data = sink.audio_data
+            if not audio_data:
+                # No audio in the sink at all. This means no packets have been
+                # received and decoded (voice connect timed out, DAVE, or the
+                # user is silent). Log it so we can distinguish from the
+                # "user is present but silent" case.
+                if speaking_users:
+                    logger.warning(
+                        "Diagnostic: recording active but sink.audio_data is EMPTY "
+                        f"while {len(speaking_users)} user(s) are tracked as speaking. "
+                        "No audio packets have been received/decoded. Likely causes: "
+                        "voice connect timed out, DAVE/E2EE, or no packets arriving."
+                    )
+                continue
+            # Report per-user byte counts.
+            parts = []
+            total_bytes = 0
+            for user_id, entry in audio_data.items():
+                try:
+                    nbytes = len(entry.file.getvalue())
+                except Exception:
+                    nbytes = -1
+                total_bytes += max(0, nbytes)
+                username = speaking_users.get(user_id, {}).get('username', f"uid:{user_id}")
+                parts.append(f"{username}={nbytes}B")
+            logger.info(
+                f"Diagnostic: sink has {len(audio_data)} user(s) with audio, "
+                f"total={total_bytes}B. Per-user: {', '.join(parts)}"
+            )
+        except Exception as e:
+            logger.error(f"Error in diagnostic_audio_report: {type(e).__name__}: {e}")
 
 # --- Unsent WAV Retry Task ---
 async def retry_unsent_wavs():
@@ -828,6 +918,7 @@ if __name__ == "__main__":
         session_task = asyncio.create_task(ssh_session_manager())
         reconnect_task = asyncio.create_task(voice_reconnect_loop())
         retry_task = asyncio.create_task(retry_unsent_wavs())
+        diagnostic_task = asyncio.create_task(diagnostic_audio_report())
         try:
             await bot.start(BOT_TOKEN)
         finally:
@@ -835,5 +926,6 @@ if __name__ == "__main__":
             session_task.cancel()
             reconnect_task.cancel()
             retry_task.cancel()
+            diagnostic_task.cancel()
 
     asyncio.run(run_bot())
