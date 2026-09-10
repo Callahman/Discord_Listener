@@ -1,36 +1,31 @@
 # Pi Listener
 
-Discord voice recording bot for Raspberry Pi 3. Records speakers in a pre-specified voice channel, saves the audio as a WAV file, and forwards it to a local-network tower over SSH/SCP for transcription and LLM processing.
+Lightweight text-only Discord trigger for Raspberry Pi. Watches for user activity (entering the target voice channel or sending a message in the target text channel) and sends a Wake-on-LAN packet to wake the tower. The tower handles all voice recording, transcription, and LLM processing.
 
 ## Setup
 
 ### 1. Install system packages
 
-The following terminal commands install everything the Pi Listener needs on a
-headless Raspberry Pi (Raspberry Pi OS 64-bit). Run them in an SSH or serial
-console session:
+The following terminal commands install everything the Pi Listener needs on a headless Raspberry Pi (Raspberry Pi OS 64-bit). Run them in an SSH or serial console session:
 
 ```bash
 # Update the package index and upgrade installed packages
 sudo apt update && sudo apt upgrade -y
 
-# Install Python, the venv module, git, the SSH client (for scp/ssh to the
-tower), and the Opus library (needed by py-cord's WaveSink for audio decode)
-sudo apt install -y python3 python3-pip python3-venv git ssh libopus0
+# Install Python, the venv module, git, and the SSH client (for the optional
+# SSH keepalive session to the tower)
+sudo apt install -y python3 python3-pip python3-venv git ssh
 
 # Verify the versions
 python3 --version   # expect 3.9+
 ssh -V              # expect an OpenSSH version
 ```
 
-> **Note:** `ssh` provides both the `ssh` and `scp` clients used to transfer
-> WAV files to the tower. `libopus0` is required for py-cord's `WaveSink`
-> Opus decoding; without it audio capture will fail.
+> **Note:** The Pi no longer needs `libopus0` or any voice-related system packages. Voice recording has moved to the tower.
 
 ### 2. Clone the repository
 
-The repo is shared by the Pi and the tower. Clone it to `~/discord_listener`
-so the repo-relative directory defaults in `bot.py` resolve correctly:
+The repo is shared by the Pi and the tower. Clone it to `~/discord_listener`:
 
 ```bash
 mkdir -p ~/discord_listener
@@ -66,16 +61,18 @@ nano .env
 
 Required values:
 - `DISCORD_BOT_TOKEN` — your Discord bot token from the Developer Portal
-- `DISCORD_VOICE_CHANNEL_ID` — the ID of the voice channel to join
+- `DISCORD_VOICE_CHANNEL_ID` — the ID of the voice channel to watch for user entry
+- `TEXT_CHANNEL_ID` — the ID of the text channel to watch for user messages
 - `TOWER_HOST` — the tower's fixed LAN IP or hostname
 - `WOL_MAC_ADDRESS` — the tower's MAC address (for Wake-on-LAN)
 - `TOWER_SSH_USER` — the SSH user on the tower
 
 Optional values:
 - `TOWER_SSH_KEY` — path to the Pi's private SSH key (defaults to `~/.ssh/id_ed25519`)
-- `TOWER_UPLOAD_DIR` — destination directory on the tower (defaults to `discord_listener/Server_Listener/incoming`, repo-relative; do not use a `~` path here because it would be expanded on the Pi, not the tower)
 
-### 6. Set up SSH key authentication (one-time)
+### 6. Set up SSH key authentication (one-time, optional)
+
+If you want to use the optional SSH keepalive session to keep the tower awake during activity:
 
 Generate an SSH keypair on the Pi (if you don't already have one):
 
@@ -87,19 +84,6 @@ Copy the public key to the tower:
 
 ```bash
 ssh-copy-id <TOWER_SSH_USER>@<TOWER_HOST>
-```
-
-Verify that you can SCP a file to the tower non-interactively:
-
-```bash
-echo "test" > /tmp/test.txt
-scp -i ~/.ssh/id_ed25519 /tmp/test.txt <TOWER_SSH_USER>@<TOWER_HOST>:~/discord_listener/incoming/
-```
-
-### 7. Create the recordings directory
-
-```bash
-mkdir -p ~/discord_listener/recordings
 ```
 
 ## Running the Bot
@@ -117,7 +101,7 @@ Create a file at `/etc/systemd/system/discord_listener.service`:
 
 ```ini
 [Unit]
-Description=Discord Voice Recording Bot
+Description=Discord Text-Only Trigger Bot
 After=network.target
 
 [Service]
@@ -149,27 +133,27 @@ journalctl -u discord_listener -f
 
 ## How It Works
 
-1. **Connection** — The bot logs in to Discord and joins the pre-specified voice channel.
-2. **Listening & Detection** — The bot monitors the voice-gateway speaking hook (op 5) to detect when users start/stop speaking.
-3. **Recording** — The bot uses py-cord's documented `start_listening()` API with a `WaveSink` to record incoming audio. The `WaveSink` handles DTLS/SRTP decryption and Opus decoding internally, producing 16-bit 48kHz WAV data per user.
-4. **Saving** — When a speaker stops, the bot retrieves the user's recorded audio from the `WaveSink` via `get_user_audio(user_id)` and writes it to a WAV file (`~/discord_listener/recordings/recording_{N}.wav`). N starts at 1 and increments while a file with that name already exists, so an unsent recording is never overwritten.
-5. **Sending** — The bot transfers the WAV file to the tower via atomic SSH/SCP (writes a `.part` file, then renames to `.wav` on the tower so the watcher never sees a partial file). If the tower is asleep, it sends a Wake-on-LAN packet and waits up to 300 s for the tower to become reachable before transferring. After a successful transfer, the local WAV file is deleted.
+1. **Connection** — The bot logs in to Discord (text-only, no voice).
+2. **Voice Channel Detection** — The bot monitors `on_voice_state_update` to detect when a user enters the target voice channel.
+3. **Text Channel Detection** — The bot monitors `on_message` to detect when a user sends a message in the target text channel.
+4. **Wake-on-LAN** — On either trigger, the bot sends a Wake-on-LAN magic packet to the tower's MAC address.
+5. **Optional SSH Keepalive** — A background coroutine can maintain a long-lived SSH session to keep the tower awake while users are present in the voice channel (ACTIVE/GRACE/CLOSED state machine).
 
-### DAVE (End-to-End Encryption) Caveat
+### Why Text-Only?
 
-py-cord's `start_listening()` may not capture audio if the voice channel is subject to DAVE (Discord's End-to-End Encryption for voice calls). DAVE is a platform-level feature that cannot be disabled by server owners. The bot detects DAVE at runtime via `vc.is_dave_connection()` and logs a warning after connecting. Test in your specific channel before deployment to confirm that audio capture works.
+The Pi cannot sustain a voice connection due to OS scheduling limitations. The voice pipeline demands a responsive event loop for the 60-second handshake, continuous UDP socket management, and tight heartbeat-ACK windows. A throttling Pi will eventually drop it. A text-only gateway sends one heartbeat every ~41 seconds and tolerates significant delay, so the Pi can maintain it even under load. The tower has the CPU headroom, thermal margin, and fast storage to run the voice pipeline reliably.
 
-### Persistent SSH Session Manager
+### Persistent SSH Session Manager (Optional)
 
-A background coroutine maintains the SSH session to the tower, keeping it awake while Discord voice activity warrants it:
+A background coroutine maintains the SSH session to the tower, keeping it awake while Discord activity warrants it:
 
-- **ACTIVE** — ≥1 user in the voice channel. Keep the session alive. If the user is present but inactive/silent for 20 min → CLOSED.
+- **ACTIVE** — ≥1 user in the voice channel. Keep the session alive.
 - **GRACE** — No user in the voice channel. Keep the session alive for 5 min (reconnection buffer). If a user re-enters within 5 min → ACTIVE. If 5 min elapse with no user → CLOSED.
-- **CLOSED** — Terminate the session. The tower sleeps on its own 20-min inactivity rule. Re-awakened via WoL when the next transfer/entry needs it.
+- **CLOSED** — Terminate the session. The tower sleeps on its own inactivity rule. Re-awakened via WoL when the next trigger needs it.
 
 ## Troubleshooting
 
-- **Bot not joining voice channel** — Verify the bot has `Connect`, `Speak`, and `View Channels` permissions in the target channel.
-- **No audio recorded** — Verify `py-cord` is installed (`pip install py-cord`) and the system `libopus0` package is present (`sudo apt install libopus0`). The audio capture is implemented in `CustomVoiceClient` in `bot.py` using py-cord's documented `start_listening()` API with a `WaveSink`. If the voice channel is subject to DAVE (End-to-End Encryption), `start_listening()` may not capture audio — the bot logs a warning via `vc.is_dave_connection()` after connecting. Test in your specific channel before deployment to confirm that audio capture works.
-- **SCP failing** — Verify SSH key authentication is set up correctly and the tower's `authorized_keys` contains the Pi's public key. Also verify the SSH key path in `.env` matches the key you generated (the README uses `ssh-keygen -t ed25519`, producing `~/.ssh/id_ed25519`, which is the code's default).
+- **Bot not staying connected** — Verify the `DISCORD_BOT_TOKEN` is correct and the bot has `View Channels` permission in the target voice and text channels.
 - **Tower not waking** — Verify the tower's MAC address in `.env` is correct and the tower is configured to accept Wake-on-LAN packets. Wake-on-LAN via broadcast only reaches the tower if both devices are on the same L2 segment (same switch/VLAN). If the tower is on another subnet, use a directed broadcast or a WoL relay. Also ensure the tower has a static IP or reserved DHCP lease matching `TOWER_HOST`.
+- **No trigger on voice entry** — Verify the `DISCORD_VOICE_CHANNEL_ID` in `.env` matches the actual voice channel ID. The bot only triggers when a user enters that specific channel.
+- **No trigger on text message** — Verify the `TEXT_CHANNEL_ID` in `.env` matches the actual text channel ID. The bot only triggers on messages in that specific channel.
