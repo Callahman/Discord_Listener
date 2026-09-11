@@ -150,7 +150,7 @@ intents.presences = True
 discord_client = discord.Client(intents=intents)
 
 # --- Voice Bot Registration ---
-from voice_bot import register_voice_handlers, voice_reconnect_loop, diagnostic_audio_report, cleanup_inactive_users, _do_voice_connect
+from voice_bot import register_voice_handlers, voice_reconnect_loop, diagnostic_audio_report, cleanup_inactive_users, _do_voice_connect, keep_awake_loop, update_keep_awake_activity
 
 register_voice_handlers(discord_client)
 
@@ -180,7 +180,11 @@ async def on_message(message):
     text = message.content.strip()
     if not text:
         return
-    
+
+    # Update the keep-awake activity timestamp so the tower stays awake
+    # while text activity is occurring.
+    update_keep_awake_activity()
+
     logger.info(f"Text message from {message.author.name}: {text[:100]}")
     log_activity({'user': message.author.name, 'channel': TEXT_CHANNEL_ID, 'text': text, 'stage': 'text_received'})
     
@@ -380,6 +384,7 @@ if __name__ == "__main__":
         reconnect_task = asyncio.create_task(voice_reconnect_loop())
         diagnostic_task = asyncio.create_task(diagnostic_audio_report())
         cleanup_task = asyncio.create_task(cleanup_inactive_users())
+        keep_awake_task = asyncio.create_task(keep_awake_loop())
 
         try:
             # Start the file watcher and the Discord client concurrently
@@ -392,5 +397,6 @@ if __name__ == "__main__":
             reconnect_task.cancel()
             diagnostic_task.cancel()
             cleanup_task.cancel()
+            keep_awake_task.cancel()
 
     asyncio.run(run_server())

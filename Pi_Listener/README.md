@@ -138,6 +138,8 @@ journalctl -u discord_listener -f
 3. **Text Channel Detection** — The bot monitors `on_message` to detect when a user sends a message in the target text channel.
 4. **Wake-on-LAN** — On either trigger, the bot sends a Wake-on-LAN magic packet to the tower's MAC address.
 5. **Optional SSH Keepalive** — A background coroutine can maintain a long-lived SSH session to keep the tower awake while users are present in the voice channel (ACTIVE/GRACE/CLOSED state machine).
+6. **State-Based WOL Catch-Up** — While any user is present in the target voice channel, a quiet WOL packet is sent every 30 s (WOL is idempotent — an already-awake tower ignores it). This guarantees the tower is woken even if the join event was missed, e.g. while the gateway session was down or the event loop was starved by OS load.
+7. **Text Channel Catch-Up** — Every 60 s the bot fetches recent messages in the target text channel and WOLs the tower if a non-bot user has messaged since the last check. This catches messages sent while the gateway session was down.
 
 ### Why Text-Only?
 
@@ -153,6 +155,7 @@ A background coroutine maintains the SSH session to the tower, keeping it awake 
 
 ## Troubleshooting
 
+- **"Can't keep up" / "heartbeat blocked for more than N seconds" warnings** — The event loop is being starved by the OS, not blocked by the bot's code (the loop-thread traceback points at `epoll.poll`, i.e. the loop is idle but not being scheduled). Check CPU load (`top` — on a Pi-hole box, look at the FTL process), thermal throttling (`vcgencmd measure_temp`, `vcgencmd get_throttled`), and swap thrashing (`free -h`, `vmstat 1`). The bot auto-recovers via gateway resume, and the state-based WOL catch-up covers missed triggers, but fix the underlying load — e.g. move Pi-hole to the tower, add cooling, or raise the service's CPU priority (`Nice=-5` in the systemd unit).
 - **Bot not staying connected** — Verify the `DISCORD_BOT_TOKEN` is correct and the bot has `View Channels` permission in the target voice and text channels.
 - **Tower not waking** — Verify the tower's MAC address in `.env` is correct and the tower is configured to accept Wake-on-LAN packets. Wake-on-LAN via broadcast only reaches the tower if both devices are on the same L2 segment (same switch/VLAN). If the tower is on another subnet, use a directed broadcast or a WoL relay. Also ensure the tower has a static IP or reserved DHCP lease matching `TOWER_HOST`.
 - **No trigger on voice entry** — Verify the `DISCORD_VOICE_CHANNEL_ID` in `.env` matches the actual voice channel ID. The bot only triggers when a user enters that specific channel.

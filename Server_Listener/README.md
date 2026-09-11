@@ -80,6 +80,8 @@ Required values:
 
 Optional values:
 - `RECORDINGS_DIR` — the directory where the voice bot writes WAV files (defaults to `~/discord_listener/Server_Listener/recordings`)
+- `KEEP_AWAKE_DIR` — the directory where the tower's idle-shutdown script checks for lockfiles (defaults to `/var/run/keep-awake.d`). The bot drops a lockfile here while users are active (in the VC or text channel) to prevent the tower from shutting down
+- `KEEP_AWAKE_GRACE_SECONDS` — grace period in seconds after the last user leaves the VC or sends a text message before the lockfile is removed (defaults to `300` = 5 min)
 - `WHISPER_MODEL_SIZE` — the size of the Whisper model to use (defaults to `base`)
 - `OLLAMA_BASE_URL` — base URL of the Ollama instance (defaults to `http://localhost:11434`)
 - `OLLAMA_MODEL` — the model tag exactly as shown by `ollama list` (defaults to `qwen3.5:latest`)
@@ -114,6 +116,10 @@ Type=simple
 User=toweruser
 WorkingDirectory=/home/toweruser/discord_listener/Server_Listener
 ExecStart=/home/toweruser/discord_listener/venv/bin/python /home/toweruser/discord_listener/Server_Listener/server.py
+# Create /run/keep-awake.d owned by the service user before ExecStart runs.
+# The bot runs as a non-root user and needs write access to the keep-awake
+# lockfile directory. Without this, the keep-awake feature silently fails.
+RuntimeDirectory=keep-awake.d
 Restart=on-failure
 RestartSec=5
 
@@ -175,6 +181,21 @@ py-cord's `start_listening()` may not capture audio if the voice channel is subj
 ### Activity Log
 
 Every pipeline event (success or failure) is appended to `LOG_DIR/activity.jsonl` for review and debugging. The log is rotated automatically (5 MB × 5 backups) so it does not grow unbounded.
+
+### Keep-Awake (Tower Idle-Shutdown Guard)
+
+The tower's idle-shutdown script checks `/var/run/keep-awake.d/` for lockfiles. While any user is active (in the target voice channel or the target text channel), the bot drops a lockfile there to prevent the tower from shutting down. The lockfile is removed after the grace period (`KEEP_AWAKE_GRACE_SECONDS`, default 5 min) has elapsed with no further activity.
+
+**Systemd requirement:** The bot runs as a non-root user, so it cannot write to `/var/run/keep-awake.d/` unless the directory is owned by the service user. Add `RuntimeDirectory=keep-awake.d` to the `[Service]` section of the systemd unit (shown in the service example above). systemd creates `/run/keep-awake.d` owned by the service user before `ExecStart` runs. Without this, the keep-awake feature silently fails (the bot logs a permission error and the tower behaves as before).
+
+**Behavior:**
+- **User in VC** — the lockfile is present; the tower stays awake. Live VC occupancy is the source of truth (a timestamp alone goes stale if a user sits in the VC longer than the grace period).
+- **User sends text** — the lockfile is present for `KEEP_AWAKE_GRACE_SECONDS` after the last message.
+- **Last user leaves VC** — the lockfile is removed after the grace period; the tower's idle countdown then runs (typically ~20 min) before shutdown.
+- **Bot's own messages** — ignored for keep-awake (existing `if message.author.bot: return` guard in `on_message`).
+- **User already in VC at bot connect** — enumerated after (re)connecting and started for recording (fixes missed audio for users present at connect time, since `on_voice_state_update` only fires on changes).
+
+**Stale lockfile cleanup:** On startup, the bot removes any stale lockfile left by a previous (crashed) run. `/var/run` is tmpfs so a reboot clears it; this covers crash-without-reboot.
 
 ## Troubleshooting
 

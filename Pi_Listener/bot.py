@@ -37,8 +37,15 @@ intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 
 # --- Wake-on-LAN Helper ---
-def send_wol(mac_address: str):
-    """Send a Wake-on-LAN magic packet to the specified MAC address."""
+def send_wol(mac_address: str, verbose: bool = True):
+    """Send a Wake-on-LAN magic packet to the specified MAC address.
+
+    WOL is idempotent: a magic packet addressed to an already-awake machine is
+    simply dropped by its NIC. This makes it safe to call periodically as a
+    state-based catch-up (see ssh_session_manager and text_channel_catchup),
+    which guarantees the tower is woken even if the corresponding gateway
+    event was missed (e.g. while the session was down or the loop was starved).
+    """
     if not mac_address:
         return
     try:
@@ -48,7 +55,8 @@ def send_wol(mac_address: str):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.sendto(packet, ('<broadcast>', 9))
         sock.close()
-        print(f"Wake-on-LAN packet sent to {mac_address}")
+        if verbose:
+            print(f"Wake-on-LAN packet sent to {mac_address}")
     except Exception as e:
         print(f"Failed to send Wake-on-LAN packet: {e}")
 
@@ -202,7 +210,14 @@ def _keepalive_alive() -> bool:
     return True
 
 async def ssh_session_manager():
-    """Background coroutine that maintains the SSH session to the tower."""
+    """Background coroutine that maintains the SSH session to the tower and
+    provides state-based WOL catch-up.
+
+    While any user is present in the target voice channel, a quiet WOL packet
+    is sent every tick. This is idempotent and ensures the tower is woken even
+    if the on_voice_state_update join event was missed (e.g. while the gateway
+    session was down, or while the event loop was starved by OS load).
+    """
     while True:
         await asyncio.sleep(30)
         now = datetime.now()
@@ -222,6 +237,9 @@ async def ssh_session_manager():
             # Keep the session alive (retry if the proc died).
             if not _keepalive_alive():
                 open_ssh_keepalive()
+
+            # State-based WOL catch-up (idempotent; quiet).
+            send_wol(WOL_MAC_ADDRESS, verbose=False)
         else:
             # No users in the channel -> GRACE state
             if now - last_user_presence > GRACE_LIMIT:
@@ -231,6 +249,47 @@ async def ssh_session_manager():
                 # Keep the session alive for the reconnection buffer.
                 if not _keepalive_alive():
                     open_ssh_keepalive()
+
+# --- Text Channel Catch-Up ---
+# The on_message trigger only fires while the gateway session is healthy. If
+# the loop is starved and the session drops (Discord closes it after ~120 s of
+# missed heartbeats; py-cord resumes automatically), messages sent in the text
+# channel during the outage are missed. This coroutine periodically fetches
+# recent messages and WOLs the tower if a non-bot user has messaged since the
+# last check. The first fetch only establishes a baseline (no trigger), so a
+# restart does not re-trigger for old messages.
+_last_text_message_id = None
+
+async def text_channel_catchup():
+    global _last_text_message_id
+    while True:
+        await asyncio.sleep(60)
+        try:
+            channel = bot.get_channel(TEXT_CHANNEL_ID)
+            if channel is None:
+                continue
+            newest = 0
+            missed = None
+            async for msg in bot.fetch_channel_messages(channel, limit=25):
+                if msg.id > newest:
+                    newest = msg.id
+                if _last_text_message_id is None or msg.id > _last_text_message_id:
+                    if missed is None and not msg.author.bot and msg.content.strip():
+                        missed = (msg.author.name, msg.id)
+            if newest == 0:
+                continue
+            if _last_text_message_id is None:
+                _last_text_message_id = newest
+                logger.info(f"Text catch-up baseline set at message id {newest}.")
+                continue
+            _last_text_message_id = newest
+            if missed is not None:
+                _trigger_tower(
+                    f"Text catch-up: user {missed[0]} messaged in text channel "
+                    f"{TEXT_CHANNEL_ID} (message id {missed[1]})"
+                )
+        except Exception as e:
+            logger.warning(f"Text catch-up check failed: {type(e).__name__}: {e}")
 
 # --- Run the Bot ---
 if __name__ == "__main__":
@@ -253,9 +312,12 @@ if __name__ == "__main__":
         # Optional: keep the tower awake via a long-lived SSH session while
         # users are present in the voice channel.
         session_task = asyncio.create_task(ssh_session_manager())
+        # Catch up on text-channel messages missed while the gateway was down.
+        catchup_task = asyncio.create_task(text_channel_catchup())
         try:
             await bot.start(BOT_TOKEN)
         finally:
             session_task.cancel()
+            catchup_task.cancel()
 
     asyncio.run(run_bot())

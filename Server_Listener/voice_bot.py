@@ -13,14 +13,110 @@ logger = logging.getLogger(__name__)
 
 # --- Voice Bot Configuration ---
 VOICE_CHANNEL_ID = int(os.getenv("DISCORD_VOICE_CHANNEL_ID", "0"))
+TEXT_CHANNEL_ID = int(os.getenv("TEXT_CHANNEL_ID", "0"))
 RECORDINGS_DIR = os.path.expanduser(os.getenv("RECORDINGS_DIR", os.path.join(os.path.expanduser("~"), "discord_listener", "recordings")))
 
 # Ensure recordings directory exists
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
+# --- Keep-Awake Configuration ---
+# The tower's idle-shutdown script checks /var/run/keep-awake.d/ for lockfiles.
+# While the tower-bot is active (users in VC or text channel), it drops a
+# lockfile there to prevent the tower from shutting down.
+KEEP_AWAKE_DIR = os.getenv("KEEP_AWAKE_DIR", "/var/run/keep-awake.d")
+KEEP_AWAKE_LOCKFILE = "discord_tower_bot"
+KEEP_AWAKE_GRACE_SECONDS = int(os.getenv("KEEP_AWAKE_GRACE_SECONDS", "300"))  # 5 min grace buffer
+
 # --- State Tracking ---
 # {user_id: {'start_time': datetime, 'last_activity': datetime, 'username': str}}
 speaking_users = {}
+
+# --- Keep-Awake State ---
+# Tracks the last time any user was active (in VC or sent a text message).
+# The keep-awake loop checks this timestamp and drops/removes the lockfile
+# based on whether the grace period has elapsed.
+_last_activity = None  # datetime or None
+_keep_awake_lockfile_path = None  # path to the current lockfile, or None
+
+# --- Keep-Awake Loop ---
+async def keep_awake_loop():
+    """Drop or remove the keep-awake lockfile based on user activity.
+
+    While any user is active (in the VC or sent a text message) and the grace
+    period has not elapsed, the lockfile is present in /var/run/keep-awake.d/.
+    The tower's idle-shutdown script checks that directory and resets its idle
+    counter if any file is present.
+
+    The lockfile is dropped when activity is detected and removed after the
+    grace period (5 min) has elapsed with no further activity.
+    """
+    global _keep_awake_lockfile_path, _last_activity
+
+    # Remove a stale lockfile left by a previous (crashed) run. /var/run is tmpfs
+    # so reboot clears it; this covers crash-without-reboot.
+    try:
+        stale = os.path.join(KEEP_AWAKE_DIR, KEEP_AWAKE_LOCKFILE)
+        if os.path.exists(stale):
+            os.remove(stale)
+            logger.info(f"Removed stale keep-awake lockfile: {stale}")
+    except Exception as e:
+        logger.warning(f"Could not check/remove stale lockfile: {type(e).__name__}: {e}")
+
+    while True:
+        await asyncio.sleep(30)  # Check every 30 seconds
+
+        now = datetime.now()
+
+        # Is anyone in the target voice channel RIGHT NOW? Live occupancy is the
+        # source of truth for VC presence (a timestamp alone goes stale if a user
+        # sits in the VC longer than the grace period).
+        vc_present = False
+        try:
+            channel = discord_client.get_channel(VOICE_CHANNEL_ID)
+            if channel:
+                for vs in channel.voice_states:
+                    if vs.user and not vs.user.bot:
+                        vc_present = True
+                        break
+        except Exception:
+            pass
+
+        if vc_present:
+            # Live presence keeps activity fresh; the grace window then runs from
+            # the moment the last user leaves.
+            _last_activity = now
+            should_keep_awake = True
+        else:
+            # No one in the VC — rely on the timestamp (last leave or last text).
+            should_keep_awake = False
+            if _last_activity is not None:
+                elapsed = (now - _last_activity).total_seconds()
+                if elapsed < KEEP_AWAKE_GRACE_SECONDS:
+                    should_keep_awake = True
+
+        if should_keep_awake:
+            # Drop the lockfile if it's not already present.
+            if _keep_awake_lockfile_path is None:
+                try:
+                    os.makedirs(KEEP_AWAKE_DIR, exist_ok=True)
+                    lockfile_path = os.path.join(KEEP_AWAKE_DIR, KEEP_AWAKE_LOCKFILE)
+                    # Write a timestamp to the lockfile for debugging.
+                    with open(lockfile_path, 'w') as f:
+                        f.write(str(now))
+                    _keep_awake_lockfile_path = lockfile_path
+                    logger.info(f"Keep-awake lockfile dropped: {lockfile_path}")
+                except Exception as e:
+                    logger.error(f"Failed to drop keep-awake lockfile: {type(e).__name__}: {e}")
+        else:
+            # Remove the lockfile if it's present.
+            if _keep_awake_lockfile_path is not None:
+                try:
+                    if os.path.exists(_keep_awake_lockfile_path):
+                        os.remove(_keep_awake_lockfile_path)
+                    logger.info(f"Keep-awake lockfile removed: {_keep_awake_lockfile_path}")
+                    _keep_awake_lockfile_path = None
+                except Exception as e:
+                    logger.error(f"Failed to remove keep-awake lockfile: {type(e).__name__}: {e}")
 
 # --- Voice Connect Guard (prevents double-connect race) ---
 _voice_connecting = False
@@ -262,6 +358,16 @@ async def _do_voice_connect(channel):
         elif is_dave is False:
             logger.info("Voice channel is NOT a DAVE (E2EE) call. Voice reception should work.")
         logger.info(f"Joined voice channel: {channel.name}")
+
+        # Safety net: enumerate users ALREADY in the channel. on_voice_state_update
+        # only fires on changes, so existing users would otherwise be missed for
+        # audio (and keep-awake). Start recording for any untracked non-bot user.
+        global _last_activity
+        for vs in channel.voice_states:
+            if vs.user and not vs.user.bot:
+                _last_activity = datetime.now()
+                if vs.user.id not in speaking_users:
+                    start_recording(vs.user)
     except Exception as e:
         elapsed = time.monotonic() - t0
         logger.error(f"Failed to join voice channel after {elapsed:.1f}s: {type(e).__name__}: {e}")
@@ -365,6 +471,8 @@ def register_voice_handlers(client):
         if member.bot:
             return
 
+        global _last_activity
+
         # If the user left the target channel OR moved to another channel, stop
         # recording immediately.
         if before.channel and before.channel.id == VOICE_CHANNEL_ID and \
@@ -383,6 +491,9 @@ def register_voice_handlers(client):
             if member.id in speaking_users:
                 stop_recording(member)
             return
+
+        # User is present in the target voice channel — update keep-awake activity.
+        _last_activity = datetime.now()
 
         # Safety net: if the speaking op never fired for this user, start
         # recording here so we don't miss their audio.
@@ -416,6 +527,16 @@ def register_voice_handlers(client):
         else:
             if member.id in speaking_users:
                 stop_recording(member)
+
+def update_keep_awake_activity():
+    """Update the keep-awake activity timestamp.
+
+    Call this from the server's on_message handler when a user sends a message
+    in the target text channel. This keeps the tower awake while text activity
+    is occurring.
+    """
+    global _last_activity
+    _last_activity = datetime.now()
 
 # Module-level reference to the Discord client (set by register_voice_handlers)
 discord_client = None
