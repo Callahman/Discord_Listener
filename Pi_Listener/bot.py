@@ -270,11 +270,17 @@ async def text_channel_catchup():
                 continue
             newest = 0
             missed = None
-            async for msg in bot.fetch_channel_messages(channel, limit=25):
+            # channel.history() fetches via HTTP (works regardless of gateway
+            # state) and is available on this py-cord version.
+            async for msg in channel.history(limit=25):
                 if msg.id > newest:
                     newest = msg.id
                 if _last_text_message_id is None or msg.id > _last_text_message_id:
-                    if missed is None and not msg.author.bot and msg.content.strip():
+                    # Match on_message semantics: any non-bot message counts.
+                    # Do NOT check msg.content — if the app lacks the
+                    # message_content intent, the REST API returns empty
+                    # content and the check would silently disable catch-up.
+                    if missed is None and not msg.author.bot:
                         missed = (msg.author.name, msg.id)
             if newest == 0:
                 continue
